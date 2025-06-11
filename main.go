@@ -3,30 +3,163 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"runtime"
 	"time"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
+
+	"os/exec"
+
+	"gonum.org/v1/plot"
+	"gonum.org/v1/plot/plotter"
+	"gonum.org/v1/plot/vg"
 )
 
-const (
-	empty  = 0 // Puste pole
-	grass  = 1 // Trawa
-	rabbit = 2 // Królik
-	fox    = 3 // Lis
-)
+type SimParams struct {
+	Width, Height  int
+	Rabbits, Foxes int
+	GrowthRate     float64
+}
+
+func ShowMenu() SimParams {
+	rl.InitWindow(480, 320, "Ustawienia symulacji")
+	defer rl.CloseWindow()
+	rl.SetTargetFPS(60)
+
+	params := SimParams{Width: 32, Height: 16, Rabbits: 12, Foxes: 6, GrowthRate: 0.1}
+	selected := 0
+	options := []string{"Szerokość", "Wysokość", "Króliki", "Lisy", "Wzrost trawy", "Start"}
+
+	for !rl.WindowShouldClose() {
+		rl.BeginDrawing()
+		rl.ClearBackground(rl.RayWhite)
+		rl.DrawText("Menu symulacji", 120, 20, 28, rl.Black)
+
+		for i, opt := range options {
+			color := rl.Black
+			if i == selected {
+				color = rl.Red
+			}
+			val := ""
+			switch i {
+			case 0:
+				val = fmt.Sprintf("%d", params.Width)
+			case 1:
+				val = fmt.Sprintf("%d", params.Height)
+			case 2:
+				val = fmt.Sprintf("%d", params.Rabbits)
+			case 3:
+				val = fmt.Sprintf("%d", params.Foxes)
+			case 4:
+				val = fmt.Sprintf("%.2f", params.GrowthRate)
+			}
+			rl.DrawText(fmt.Sprintf("%s: %s", opt, val), 80, int32(70+30*i), 24, color)
+		}
+
+		rl.DrawText("Strzałki: wybór/opcja, Enter: start", 40, 270, 18, rl.Gray)
+		rl.EndDrawing()
+
+		if rl.IsKeyPressed(rl.KeyDown) {
+			selected = (selected + 1) % len(options)
+		}
+		if rl.IsKeyPressed(rl.KeyUp) {
+			selected = (selected - 1 + len(options)) % len(options)
+		}
+		if selected < 5 {
+			if rl.IsKeyPressed(rl.KeyRight) {
+				switch selected {
+				case 0:
+					params.Width += 2
+				case 1:
+					params.Height += 2
+				case 2:
+					params.Rabbits++
+				case 3:
+					params.Foxes++
+				case 4:
+					params.GrowthRate += 0.01
+				}
+			}
+			if rl.IsKeyPressed(rl.KeyLeft) {
+				switch selected {
+				case 0:
+					if params.Width > 4 {
+						params.Width -= 2
+					}
+				case 1:
+					if params.Height > 4 {
+						params.Height -= 2
+					}
+				case 2:
+					if params.Rabbits > 1 {
+						params.Rabbits--
+					}
+				case 3:
+					if params.Foxes > 1 {
+						params.Foxes--
+					}
+				case 4:
+					if params.GrowthRate > 0.01 {
+						params.GrowthRate -= 0.01
+					}
+				}
+			}
+		}
+		if selected == 5 && rl.IsKeyPressed(rl.KeyEnter) {
+			break
+		}
+	}
+	return params
+}
 
 type Cell struct {
-	Ground int     // Warstwa ziemi (empty, grass)
-	Animal int     // Warstwa zwierząt (empty, rabbit, fox)
-	Energy float64 // Energia zwierzęcia (dla królików i lisów)
+	Ground            int     // Warstwa ziemi (empty, grass)
+	Animal            int     // Warstwa zwierząt (empty, rabbit, fox)
+	Energy            float64 // Energia zwierzęcia
+	ReproduceCooldown int     // Cooldown rozmnażania
+	Age               int     // Wiek zwierzęcia w turach
+}
+
+const (
+	empty  = 0
+	grass  = 1
+	rabbit = 2
+	fox    = 3
+
+	rabbitReproduceEnergy = 14.0
+	foxReproduceEnergy    = 28.0
+
+	rabbitCooldown = 6
+	foxCooldown    = 10
+)
+
+var (
+	texEmpty  rl.Texture2D
+	texGrass  rl.Texture2D
+	texRabbit rl.Texture2D
+	texFox    rl.Texture2D
+)
+
+func loadTextures() {
+	texEmpty = rl.LoadTexture("empty.png")
+	texGrass = rl.LoadTexture("grass.png")
+	texRabbit = rl.LoadTexture("rabbit.png")
+	texFox = rl.LoadTexture("fox.png")
+}
+
+func unloadTextures() {
+	rl.UnloadTexture(texEmpty)
+	rl.UnloadTexture(texGrass)
+	rl.UnloadTexture(texRabbit)
+	rl.UnloadTexture(texFox)
 }
 
 type World struct {
-	Grid       [][]Cell // Plansza symulacji
-	Width      int      // Szerokość planszy
-	Height     int      // Wysokość planszy
-	MaxGrass   int      // Maksymalna ilość trawy na polu
-	GrowthRate float64  // Współczynnik wzrostu trawy
+	Grid       [][]Cell
+	Width      int
+	Height     int
+	MaxGrass   int
+	GrowthRate float64
 }
 
 func NewWorld(width, height, maxGrass int, growthRate float64) *World {
@@ -34,7 +167,7 @@ func NewWorld(width, height, maxGrass int, growthRate float64) *World {
 	for i := range grid {
 		grid[i] = make([]Cell, width)
 		for j := range grid[i] {
-			grid[i][j] = Cell{Ground: empty, Animal: empty} // Domyślnie puste pole
+			grid[i][j] = Cell{Ground: empty, Animal: empty}
 		}
 	}
 	return &World{
@@ -50,23 +183,20 @@ func NewWorld(width, height, maxGrass int, growthRate float64) *World {
 func (w *World) Initialize(rabbitCount, foxCount int) {
 	rand.Seed(time.Now().UnixNano())
 
-	// Losowe rozmieszczenie trawy
 	for y := 0; y < w.Height; y++ {
 		for x := 0; x < w.Width; x++ {
-			if rand.Float64() < 0.5 { // 50% szans na trawę
+			if rand.Float64() < 0.5 {
 				w.Grid[y][x].Ground = grass
 			}
 		}
 	}
 
-	// Losowe rozmieszczenie królików
 	for i := 0; i < rabbitCount; i++ {
 		x, y := rand.Intn(w.Width), rand.Intn(w.Height)
 		w.Grid[y][x].Animal = rabbit
 		w.Grid[y][x].Energy = 10.0
 	}
 
-	// Losowe rozmieszczenie lisów
 	for i := 0; i < foxCount; i++ {
 		x, y := rand.Intn(w.Width), rand.Intn(w.Height)
 		w.Grid[y][x].Animal = fox
@@ -74,59 +204,51 @@ func (w *World) Initialize(rabbitCount, foxCount int) {
 	}
 }
 
-// Wyświetlanie planszy w konsoli (do debugowania)
-func (w *World) Print() {
+func (w *World) DrawWorld(cellSize int) {
 	for y := 0; y < w.Height; y++ {
 		for x := 0; x < w.Width; x++ {
+			pos := rl.NewVector2(float32(x*cellSize), float32(y*cellSize))
+			rl.DrawTextureEx(texEmpty, pos, 0, float32(cellSize)/float32(texEmpty.Width), rl.White)
+			if w.Grid[y][x].Ground == grass {
+				rl.DrawTextureEx(texGrass, pos, 0, float32(cellSize)/float32(texGrass.Width), rl.White)
+			}
 			if w.Grid[y][x].Animal == rabbit {
-				fmt.Print("R ")
+				rl.DrawTextureEx(texRabbit, pos, 0, float32(cellSize)/float32(texRabbit.Width), rl.White)
 			} else if w.Grid[y][x].Animal == fox {
-				fmt.Print("F ")
-			} else if w.Grid[y][x].Ground == grass {
-				fmt.Print("G ")
-			} else {
-				fmt.Print(". ")
+				rl.DrawTextureEx(texFox, pos, 0, float32(cellSize)/float32(texFox.Width), rl.White)
 			}
 		}
-		fmt.Println()
 	}
 }
 
-func (w *World) DrawWorld(cellSize int) {
-	// Najpierw rysuj tło
-	for y := 0; y < w.Height; y++ {
-		for x := 0; x < w.Width; x++ {
-			color := rl.LightGray
-			if w.Grid[y][x].Ground == grass {
-				color = rl.Green
+func neighbors(x, y, width, height int) [][2]int {
+	var result [][2]int
+	for dx := -1; dx <= 1; dx++ {
+		for dy := -1; dy <= 1; dy++ {
+			if dx == 0 && dy == 0 {
+				continue
 			}
-			rl.DrawRectangle(
-				int32(x*cellSize), int32(y*cellSize),
-				int32(cellSize), int32(cellSize),
-				color,
-			)
+			nx, ny := x+dx, y+dy
+			if nx >= 0 && nx < width && ny >= 0 && ny < height {
+				result = append(result, [2]int{nx, ny})
+			}
 		}
 	}
+	return result
+}
 
-	// Potem rysuj zwierzęta (na wierzchu)
+func (w *World) Copy() *World {
+	newGrid := make([][]Cell, w.Height)
 	for y := 0; y < w.Height; y++ {
-		for x := 0; x < w.Width; x++ {
-			if w.Grid[y][x].Animal == rabbit {
-				rl.DrawCircle(
-					int32(x*cellSize+cellSize/2),
-					int32(y*cellSize+cellSize/2),
-					float32(cellSize/3),
-					rl.Blue,
-				)
-			} else if w.Grid[y][x].Animal == fox {
-				rl.DrawCircle(
-					int32(x*cellSize+cellSize/2),
-					int32(y*cellSize+cellSize/2),
-					float32(cellSize/3),
-					rl.Red,
-				)
-			}
-		}
+		newGrid[y] = make([]Cell, w.Width)
+		copy(newGrid[y], w.Grid[y])
+	}
+	return &World{
+		Grid:       newGrid,
+		Width:      w.Width,
+		Height:     w.Height,
+		MaxGrass:   w.MaxGrass,
+		GrowthRate: w.GrowthRate,
 	}
 }
 
@@ -141,95 +263,238 @@ func (w *World) GrowGrass() {
 }
 
 func (w *World) MoveRabbits() {
+	newGrid := w.Copy().Grid
+
 	for y := 0; y < w.Height; y++ {
 		for x := 0; x < w.Width; x++ {
-			if w.Grid[y][x].Animal == rabbit {
-				// Ogranicz ruch do sąsiednich pól (bez wyjścia poza planszę)
-				newX := x + rand.Intn(3) - 1 // -1, 0, 1
-				newY := y + rand.Intn(3) - 1 // -1, 0, 1
+			cell := w.Grid[y][x]
+			if cell.Animal == rabbit && cell.ReproduceCooldown == 0 {
+				ns := neighbors(x, y, w.Width, w.Height)
+				done := false
 
-				// Sprawdź, czy nowa pozycja jest w granicach planszy
-				if newX >= 0 && newX < w.Width && newY >= 0 && newY < w.Height {
-					if w.Grid[newY][newX].Animal == empty {
-						// Zjedz trawę, jeśli jest
-						if w.Grid[newY][newX].Ground == grass {
-							w.Grid[newY][newX].Ground = empty
-							w.Grid[y][x].Energy += 5
+				// 1. Ucieczka przed lisem
+				foxes := [][2]int{}
+				for _, n := range ns {
+					if w.Grid[n[1]][n[0]].Animal == fox {
+						foxes = append(foxes, n)
+					}
+				}
+				if len(foxes) > 0 && !done {
+					maxDist := -1.0
+					var best [2]int
+					for _, n := range ns {
+						if w.Grid[n[1]][n[0]].Animal == empty {
+							minDist := 1000.0
+							for _, f := range foxes {
+								dx := float64(n[0] - f[0])
+								dy := float64(n[1] - f[1])
+								dist := dx*dx + dy*dy
+								if dist < minDist {
+									minDist = dist
+								}
+							}
+							if minDist > maxDist {
+								maxDist = minDist
+								best = n
+							}
 						}
+					}
+					if maxDist >= 0 {
+						newGrid[best[1]][best[0]] = cell
+						newGrid[y][x] = Cell{Ground: w.Grid[y][x].Ground}
+						cell.Age++
+						done = true
+					}
+				}
 
-						// Przenieś królika
-						w.Grid[newY][newX].Animal = rabbit
-						w.Grid[newY][newX].Energy = w.Grid[y][x].Energy
-						w.Grid[y][x].Animal = empty
-						w.Grid[y][x].Energy = 0
+				// 2. Szukanie trawy gdy głodny
+				if !done && cell.Energy < rabbitReproduceEnergy {
+					for _, n := range ns {
+						if w.Grid[n[1]][n[0]].Animal == empty && w.Grid[n[1]][n[0]].Ground == grass {
+							cell.Energy += 10 // zwiększ energię po zjedzeniu trawy
+							cell.Ground = w.Grid[y][x].Ground
+							newGrid[n[1]][n[0]] = cell
+							newGrid[y][x] = Cell{Ground: w.Grid[y][x].Ground}
+							// USUŃ trawę po zjedzeniu
+							newGrid[n[1]][n[0]].Ground = empty
+							cell.Age++
+							done = true
+							break
+						}
+					}
+				}
+
+				// 3. Szukanie królika do rozmnożenia
+				if !done && cell.Energy >= rabbitReproduceEnergy {
+					for _, n := range ns {
+						other := w.Grid[n[1]][n[0]]
+						if other.Animal == rabbit && other.ReproduceCooldown == 0 {
+							if y < n[1] || (y == n[1] && x < n[0]) {
+								for _, emptyN := range ns {
+									if w.Grid[emptyN[1]][emptyN[0]].Animal == empty {
+										newGrid[emptyN[1]][emptyN[0]] = Cell{
+											Ground:            w.Grid[emptyN[1]][emptyN[0]].Ground,
+											Animal:            rabbit,
+											Energy:            cell.Energy / 2,
+											ReproduceCooldown: rabbitCooldown,
+											Age:               0,
+										}
+										cell.Energy = cell.Energy / 2
+										cell.ReproduceCooldown = rabbitCooldown
+										newGrid[y][x] = cell
+										cell.Age++
+										done = true
+										break
+									}
+								}
+							}
+							if done {
+								break
+							}
+						}
+					}
+				}
+
+				// 4. Ruch losowy jeśli nic innego nie zadziałało
+				if !done {
+					rand.Shuffle(len(ns), func(i, j int) { ns[i], ns[j] = ns[j], ns[i] })
+					for _, n := range ns {
+						if w.Grid[n[1]][n[0]].Animal == empty {
+							newGrid[n[1]][n[0]] = cell
+							newGrid[y][x] = Cell{Ground: w.Grid[y][x].Ground}
+							cell.Age++
+							break
+						}
 					}
 				}
 			}
 		}
 	}
+	w.Grid = newGrid
 }
 
 func (w *World) MoveFoxes() {
+	newGrid := w.Copy().Grid
+
 	for y := 0; y < w.Height; y++ {
 		for x := 0; x < w.Width; x++ {
-			if w.Grid[y][x].Animal == fox {
-				newX := x + rand.Intn(3) - 1
-				newY := y + rand.Intn(3) - 1
+			cell := w.Grid[y][x]
+			if cell.Animal == fox && cell.ReproduceCooldown == 0 {
+				ns := neighbors(x, y, w.Width, w.Height)
+				done := false
 
-				if newX >= 0 && newX < w.Width && newY >= 0 && newY < w.Height {
-					if w.Grid[newY][newX].Animal == empty {
-						// Przenieś lisa
-						w.Grid[newY][newX].Animal = fox
-						w.Grid[newY][newX].Energy = w.Grid[y][x].Energy
-						w.Grid[y][x].Animal = empty
-						w.Grid[y][x].Energy = 0
-					} else if w.Grid[newY][newX].Animal == rabbit {
-						// Lis zjada królika
-						w.Grid[newY][newX].Animal = fox
-						w.Grid[newY][newX].Energy = w.Grid[y][x].Energy + 10
-						w.Grid[y][x].Animal = empty
-						w.Grid[y][x].Energy = 0
+				// 1. Szukanie królika gdy bardzo głodny
+				if cell.Energy < foxReproduceEnergy/2 && !done {
+					for attempt := 0; attempt < 2; attempt++ {
+						for _, n := range ns {
+							if w.Grid[n[1]][n[0]].Animal == rabbit {
+								cell.Energy += 20 // zwiększ energię po zjedzeniu królika
+								newGrid[n[1]][n[0]] = cell
+								newGrid[y][x] = Cell{Ground: w.Grid[y][x].Ground}
+								continue
+							}
+						}
+					}
+				}
+
+				// 2. Szukanie królika gdy głodny (standardowo)
+				if !done && cell.Energy < foxReproduceEnergy {
+					for _, n := range ns {
+						if w.Grid[n[1]][n[0]].Animal == rabbit {
+							cell.Energy += 20 // zwiększ energię po zjedzeniu królika
+							newGrid[n[1]][n[0]] = cell
+							newGrid[y][x] = Cell{Ground: w.Grid[y][x].Ground}
+							cell.Age++
+							done = true
+							break
+						}
+					}
+				}
+
+				// 3. Szukanie lisa do rozmnożenia
+				if !done && cell.Energy >= foxReproduceEnergy {
+					for _, n := range ns {
+						other := w.Grid[n[1]][n[0]]
+						if other.Animal == fox && other.ReproduceCooldown == 0 {
+							if y < n[1] || (y == n[1] && x < n[0]) {
+								for _, emptyN := range ns {
+									if w.Grid[emptyN[1]][emptyN[0]].Animal == empty {
+										newGrid[emptyN[1]][emptyN[0]] = Cell{
+											Ground:            w.Grid[emptyN[1]][emptyN[0]].Ground,
+											Animal:            fox,
+											Energy:            cell.Energy / 2,
+											ReproduceCooldown: foxCooldown,
+											Age:               0,
+										}
+										cell.Energy = cell.Energy / 2
+										cell.ReproduceCooldown = foxCooldown
+										newGrid[y][x] = cell
+										cell.Age++
+										done = true
+										break
+									}
+								}
+							}
+							if done {
+								break
+							}
+						}
+					}
+				}
+
+				// 4. Ruch losowy jeśli nic innego nie zadziałało
+				if !done {
+					rand.Shuffle(len(ns), func(i, j int) { ns[i], ns[j] = ns[j], ns[i] })
+					for _, n := range ns {
+						if w.Grid[n[1]][n[0]].Animal == empty {
+							newGrid[n[1]][n[0]] = cell
+							newGrid[y][x] = Cell{Ground: w.Grid[y][x].Ground}
+							cell.Age++
+							break
+						}
 					}
 				}
 			}
 		}
 	}
+	w.Grid = newGrid
 }
 
 func (w *World) UpdateEnergy() {
 	for y := 0; y < w.Height; y++ {
 		for x := 0; x < w.Width; x++ {
 			if w.Grid[y][x].Animal == rabbit || w.Grid[y][x].Animal == fox {
-				w.Grid[y][x].Energy -= 1
+				// Zużycie energii rośnie z wiekiem
+				energyLoss := 1.0 + float64(w.Grid[y][x].Age)/10.0
+				w.Grid[y][x].Energy -= energyLoss
+				if w.Grid[y][x].ReproduceCooldown > 0 {
+					w.Grid[y][x].ReproduceCooldown--
+				}
 				if w.Grid[y][x].Energy <= 0 {
-					// Zwierzę umiera z braku energii
 					w.Grid[y][x].Animal = empty
 					w.Grid[y][x].Energy = 0
+					w.Grid[y][x].ReproduceCooldown = 0
+					w.Grid[y][x].Age = 0
 				}
 			}
 		}
 	}
 }
 
-func (w *World) SimulateWithVisualization(steps, cellSize int) {
-	screenWidth := int32(w.Width * cellSize)
-	screenHeight := int32(w.Height * cellSize)
+var popHistory []struct{ Rabbits, Foxes int }
 
-	rl.InitWindow(screenWidth, screenHeight, "Symulacja Ekosystemu")
-	defer rl.CloseWindow()
-
+func (w *World) SimulateWithVisualization(cellSize int) {
 	rl.SetTargetFPS(10)
-
-	// Buforowanie stanu
 	renderState := w.Copy()
 	updateChan := make(chan *World, 1)
-	quitChan := make(chan bool)
+	quitChan := make(chan struct{})
+	popHistory = nil
 
-	// Goroutine do aktualizacji stanu
 	go func() {
-		for step := 0; step < steps; step++ {
+		for {
 			select {
 			case <-quitChan:
+				close(updateChan)
 				return
 			default:
 				w.GrowGrass()
@@ -237,31 +502,43 @@ func (w *World) SimulateWithVisualization(steps, cellSize int) {
 				w.MoveFoxes()
 				w.UpdateEnergy()
 
-				// Wyślij kopię do renderowania
-				updateChan <- w.Copy()
+				animals := countAnimals(w)
+				popHistory = append(popHistory, struct{ Rabbits, Foxes int }{
+					Rabbits: animals[rabbit], Foxes: animals[fox],
+				})
 
-				// Stałe tempo symulacji
+				select {
+				case updateChan <- w.Copy():
+				case <-quitChan:
+					close(updateChan)
+					return
+				}
+
+				if animals[rabbit]+animals[fox] == 0 {
+					close(updateChan)
+					return
+				}
 				time.Sleep(100 * time.Millisecond)
 			}
 		}
-		close(updateChan)
 	}()
 
-	// Główna pętla renderowania
+loop:
 	for !rl.WindowShouldClose() {
-		// Odbierz najnowszy stan jeśli jest dostępny
 		select {
-		case newState := <-updateChan:
-			renderState = newState
+		case newState, ok := <-updateChan:
+			if ok {
+				renderState = newState
+			} else {
+				break loop
+			}
 		default:
 		}
 
-		// Renderowanie
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.RayWhite)
 		renderState.DrawWorld(cellSize)
 
-		// Dodatkowe informacje
 		currentAnimals := countAnimals(renderState)
 		rl.DrawText(fmt.Sprintf("Króliki: %d  Lisy: %d",
 			currentAnimals[rabbit], currentAnimals[fox]), 10, 10, 20, rl.Black)
@@ -269,40 +546,12 @@ func (w *World) SimulateWithVisualization(steps, cellSize int) {
 		rl.EndDrawing()
 	}
 
-	quitChan <- true
-}
+	close(quitChan)
+	for range updateChan {
+	}
 
-// Optymalizowana wersja Copy - synchronizacja bez alokacji
-func (w *World) SyncCopy(dest *World) {
-	for y := 0; y < w.Height; y++ {
-		for x := 0; x < w.Width; x++ {
-			// Głęboka kopia struktury Cell
-			dest.Grid[y][x].Ground = w.Grid[y][x].Ground
-			dest.Grid[y][x].Animal = w.Grid[y][x].Animal
-			dest.Grid[y][x].Energy = w.Grid[y][x].Energy
-		}
-	}
-}
-
-func (w *World) Copy() *World {
-	newGrid := make([][]Cell, w.Height)
-	for y := range w.Grid {
-		newGrid[y] = make([]Cell, w.Width)
-		for x := range w.Grid[y] {
-			newGrid[y][x] = Cell{
-				Ground: w.Grid[y][x].Ground,
-				Animal: w.Grid[y][x].Animal,
-				Energy: w.Grid[y][x].Energy,
-			}
-		}
-	}
-	return &World{
-		Grid:       newGrid,
-		Width:      w.Width,
-		Height:     w.Height,
-		MaxGrass:   w.MaxGrass,
-		GrowthRate: w.GrowthRate,
-	}
+	ShowPlot()
+	openImage("populacje.png")
 }
 
 func countAnimals(w *World) map[int]int {
@@ -317,19 +566,54 @@ func countAnimals(w *World) map[int]int {
 	return counts
 }
 
+func ShowPlot() {
+	p := plot.New()
+	p.Title.Text = "Populacje w czasie"
+	p.X.Label.Text = "Tura"
+	p.Y.Label.Text = "Liczebność"
+
+	rabbits := make(plotter.XYs, len(popHistory))
+	foxes := make(plotter.XYs, len(popHistory))
+	for i, v := range popHistory {
+		rabbits[i].X = float64(i)
+		rabbits[i].Y = float64(v.Rabbits)
+		foxes[i].X = float64(i)
+		foxes[i].Y = float64(v.Foxes)
+	}
+	l1, _ := plotter.NewLine(rabbits)
+	l2, _ := plotter.NewLine(foxes)
+	l1.Color = plotter.DefaultLineStyle.Color
+	l2.Color = plotter.DefaultLineStyle.Color
+	l2.LineStyle.Dashes = []vg.Length{vg.Points(5), vg.Points(5)}
+	p.Add(l1, l2)
+	p.Legend.Add("Króliki", l1)
+	p.Legend.Add("Lisy", l2)
+	p.Legend.Top = true
+
+	p.Save(8*vg.Inch, 4*vg.Inch, "populacje.png")
+}
+
+func openImage(filename string) {
+	switch runtime.GOOS {
+	case "windows":
+		exec.Command("rundll32", "url.dll,FileProtocolHandler", filename).Start()
+	case "darwin":
+		exec.Command("open", filename).Start()
+	default:
+		exec.Command("xdg-open", filename).Start()
+	}
+}
+
 func main() {
-	// Parametry symulacji
-	width, height := 20, 10
-	maxGrass := 5
-	growthRate := 0.1
-	rabbitCount := 10
-	foxCount := 5
-	cellSize := 30 // Rozmiar komórki w pikselach
+	params := ShowMenu()
 
-	// Tworzenie świata
-	world := NewWorld(width, height, maxGrass, growthRate)
-	world.Initialize(rabbitCount, foxCount)
+	world := NewWorld(params.Width, params.Height, 8, params.GrowthRate)
+	world.Initialize(params.Rabbits, params.Foxes)
 
-	// Uruchomienie symulacji z wizualizacją
-	world.SimulateWithVisualization(100, cellSize)
+	rl.InitWindow(int32(params.Width*32), int32(params.Height*32), "Symulacja Ekosystemu")
+	loadTextures()
+	defer unloadTextures()
+	defer rl.CloseWindow()
+
+	world.SimulateWithVisualization(32)
 }
