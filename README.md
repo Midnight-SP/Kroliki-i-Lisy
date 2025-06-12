@@ -32,9 +32,10 @@ Każde zwierzę ma energię, która spada z wiekiem i rośnie po zjedzeniu pokar
    - Tło, trawa, króliki i lisy są reprezentowane przez tekstury (obrazki PNG).
    - W lewym górnym rogu wyświetlana jest aktualna liczba królików i lisów.
    - Symulacja trwa do momentu zamknięcia okna lub wyginięcia wszystkich zwierząt.
+   - Symulację można zatrzymać za pomocą przycisku pauzy (spacji)
 
 3. **Wykres populacji**  
-   Po zakończeniu symulacji automatycznie generowany jest wykres liczby królików i lisów w czasie (`populacje.png`), który otwiera się w domyślnej przeglądarce obrazów.
+   Po zakończeniu symulacji automatycznie generowany jest wykres liczby królików i lisów w czasie (`populacje.png`), który otwiera się w domyślnej przeglądarce obrazów. Podczas symulacji co kilka klatek jest aktualizowany podgląd wykresu.
 
 ## Wymagane narzędzia i biblioteki
 
